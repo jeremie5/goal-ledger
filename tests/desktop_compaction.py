@@ -18,6 +18,7 @@ FRESH_INPUT = "Synthetic fresh input: count the blue markers and report the resu
 OLD_SUMMARY = "Synthetic old request completed before the follow-up turn."
 OLD_EVIDENCE = "The local fixture completed the old request before compaction."
 RECOVERY_PREFIX = "Goal Ledger: compaction recovery"
+HANDOFF_GUIDANCE = "Use short fragments in ledger notes and agent handoffs."
 COMPACT_SUMMARY = "Synthetic compaction summary retained the old request history."
 SESSION_RE = re.compile(r"session id:\s*([0-9a-fA-F-]{36})", re.IGNORECASE)
 
@@ -291,6 +292,11 @@ GOAL_LEDGER_DB = {json.dumps(str(database))}
         captured = server.requests
         if len(captured) != 4:
             raise RuntimeError(f"expected 4 local model requests across two turns and one compaction, got {len(captured)}")
+        if not any(
+            text.startswith("Goal Ledger session ") and HANDOFF_GUIDANCE in text
+            for text in json_texts(captured[0], "developer")
+        ):
+            raise RuntimeError("the prompt hook omitted concise handoff guidance")
 
         continuation = captured[3]
         developer_texts = json_texts(continuation, "developer")
@@ -298,6 +304,8 @@ GOAL_LEDGER_DB = {json.dumps(str(database))}
         if not frames:
             raise RuntimeError("first post-compaction model request has no Goal Ledger recovery frame")
         frame = "\n".join(frames)
+        if HANDOFF_GUIDANCE not in frame:
+            raise RuntimeError("recovery frame omitted concise handoff guidance")
         if request_id not in frame or '"status":"completed"' not in frame:
             raise RuntimeError("recovery frame omitted the completed prior request ID/status")
         if OLD_EVIDENCE not in frame:
