@@ -58,10 +58,10 @@ find the most recent admitted prompt or steer and its recorded status.
 filter and a cursor for older pages. `request_get` fetches an exact request
 and its revision.
 
-Use `request_update` to record a summary, requirements, status, and the next
-action. Use short fragments in notes and handoffs. Keep the outcome, requirements,
-blockers, next action, and exact evidence references. Mark work `completed` with
-evidence such as an artifact, commit, test receipt, or job result. For example:
+Save terse fragments with `request_update`. Use one constraint per requirement
+and one concrete next action. Keep the outcome, blockers, and exact evidence
+references. Mark work `completed` with evidence such as an artifact, commit,
+test receipt, or job result. For example:
 
 ```json
 {
@@ -69,7 +69,7 @@ evidence such as an artifact, commit, test receipt, or job result. For example:
   "request_id": "the-observed-message-id",
   "expected_revision": 1,
   "status": "completed",
-  "summary": "Generated the bracket once and checked the fit",
+  "summary": "Bracket exported. Fit passed.",
   "evidence": ["reports/bracket-fit.json"]
 }
 ```

@@ -580,7 +580,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "request_update",
-            "description": "Update a tracked request's status, summary, requirements, next action, or evidence.",
+            "description": "Update request status and notes. Save terse fragments. Keep IDs and evidence refs exact.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -588,15 +588,17 @@ fn tool_definitions() -> Vec<Value> {
                     "request_id": { "type": "string", "minLength": 1, "maxLength": MAX_REQUEST_ID_CHARS },
                     "expected_revision": { "type": "integer", "minimum": 0 },
                     "status": { "type": "string", "enum": status_values() },
-                    "summary": { "type": "string", "maxLength": MAX_SUMMARY_CHARS },
+                    "summary": { "type": "string", "description": "Outcome and any blocker.", "maxLength": MAX_SUMMARY_CHARS },
                     "requirements": {
                         "type": "array",
+                        "description": "One short constraint per item.",
                         "maxItems": MAX_REQUIREMENTS,
                         "items": { "type": "string", "maxLength": MAX_REQUIREMENT_CHARS }
                     },
-                    "next_action": { "type": "string", "maxLength": MAX_NEXT_ACTION_CHARS },
+                    "next_action": { "type": "string", "description": "One concrete next step.", "maxLength": MAX_NEXT_ACTION_CHARS },
                     "evidence": {
                         "type": "array",
+                        "description": "Exact paths, commits, URLs, or job IDs. Brief proof if needed.",
                         "maxItems": MAX_EVIDENCE_ITEMS,
                         "items": { "type": "string", "maxLength": MAX_EVIDENCE_CHARS }
                     }
@@ -684,6 +686,12 @@ mod tests {
         assert_eq!(tools[1]["name"], "requests_list");
         assert_eq!(tools[2]["name"], "request_get");
         assert_eq!(tools[3]["name"], "request_update");
+        assert!(
+            tools[3]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Save terse fragments")
+        );
         assert_eq!(tools[3]["inputSchema"]["additionalProperties"], false);
     }
 
