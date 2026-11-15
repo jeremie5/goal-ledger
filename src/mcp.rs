@@ -540,7 +540,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "request_latest",
-            "description": "Read the latest known original user prompt or steer and its recorded task status. On continuation, check this before treating retained input as current work.",
+            "description": "Latest prompt or steer and status. Check on resume.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -552,7 +552,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "requests_list",
-            "description": "List a Codex session's original prompts and steers in reverse admission order. Use next_before_request_id to page to earlier requests.",
+            "description": "List prompts and steers, newest first. Page with next_before_request_id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -567,7 +567,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "request_get",
-            "description": "Read one tracked request by its session and request IDs.",
+            "description": "Read a request by ID.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -580,7 +580,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "request_update",
-            "description": "Update request status and notes. Save terse fragments. Keep IDs and evidence refs exact.",
+            "description": "Save terse fragments. Outcome/blocker, one constraint per item, one next step. Keep IDs and evidence refs exact.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -588,17 +588,15 @@ fn tool_definitions() -> Vec<Value> {
                     "request_id": { "type": "string", "minLength": 1, "maxLength": MAX_REQUEST_ID_CHARS },
                     "expected_revision": { "type": "integer", "minimum": 0 },
                     "status": { "type": "string", "enum": status_values() },
-                    "summary": { "type": "string", "description": "Outcome and any blocker.", "maxLength": MAX_SUMMARY_CHARS },
+                    "summary": { "type": "string", "maxLength": MAX_SUMMARY_CHARS },
                     "requirements": {
                         "type": "array",
-                        "description": "One short constraint per item.",
                         "maxItems": MAX_REQUIREMENTS,
                         "items": { "type": "string", "maxLength": MAX_REQUIREMENT_CHARS }
                     },
-                    "next_action": { "type": "string", "description": "One concrete next step.", "maxLength": MAX_NEXT_ACTION_CHARS },
+                    "next_action": { "type": "string", "maxLength": MAX_NEXT_ACTION_CHARS },
                     "evidence": {
                         "type": "array",
-                        "description": "Exact paths, commits, URLs, or job IDs. Brief proof if needed.",
                         "maxItems": MAX_EVIDENCE_ITEMS,
                         "items": { "type": "string", "maxLength": MAX_EVIDENCE_CHARS }
                     }

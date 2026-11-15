@@ -18,7 +18,7 @@ FRESH_INPUT = "Synthetic fresh input: count the blue markers and report the resu
 OLD_SUMMARY = "Synthetic old request completed before the follow-up turn."
 OLD_EVIDENCE = "The local fixture completed the old request before compaction."
 RECOVERY_PREFIX = "Goal Ledger: compaction recovery"
-HANDOFF_GUIDANCE = "Use short fragments in ledger notes and agent handoffs."
+HANDOFF_GUIDANCE = "Use terse notes and handoffs."
 COMPACT_SUMMARY = "Synthetic compaction summary retained the old request history."
 SESSION_RE = re.compile(r"session id:\s*([0-9a-fA-F-]{36})", re.IGNORECASE)
 
@@ -324,10 +324,11 @@ GOAL_LEDGER_DB = {json.dumps(str(database))}
             or not latest
             or latest["request_id"] == request_id
             or latest["status"] != "observed"
-            or json.loads(latest_line)["latest_user_request"]["id"] != latest["request_id"]
-            or json.loads(latest_line)["latest_user_request"]["status"] != "observed"
+            or json.loads(latest_line)["latest_user_request"] != {
+                "id": latest["request_id"], "status": "observed",
+            }
         ):
-            raise RuntimeError("recovery did not identify the fresh input as the latest observed request")
+            raise RuntimeError("recovery did not show the fresh input as observed with empty fields omitted")
         page = call_mcp_tool(ledger, env, "requests_list", {"session_id": session_id, "limit": 1})
         if page["next_before_request_id"] != latest["request_id"]:
             raise RuntimeError("request history did not return a cursor for the older request")

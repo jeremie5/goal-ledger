@@ -90,7 +90,8 @@ repeat completed work.
   local.
 - At startup, resume, or immediately after compaction, the hook sends bounded
   developer context with the latest user request's recorded status, including
-  an `observed` status. A new steer can change what should happen next.
+  an `observed` status. Recovery omits empty fields. A new steer can change
+  what should happen next.
 
 Recovery context is advisory. On an automatic turn that starts without a
 fresh prompt or a session hook, Codex can refresh the latest status using
