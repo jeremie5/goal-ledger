@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "/absolute/path/to/goal-ledger hook", "timeout": 5}]}
+    ],
+    "PreCompact": [
+      {"hooks": [{"type": "command", "command": "/absolute/path/to/goal-ledger hook", "timeout": 5}]}
+    ],
+    "SessionStart": [
+      {"matcher": "^compact$", "hooks": [{"type": "command", "command": "/absolute/path/to/goal-ledger hook", "timeout": 5}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/absolute/path/to/goal-ledger hook", "timeout": 5}]}
+    ]
+  }
+}

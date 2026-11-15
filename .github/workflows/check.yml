@@ -1,0 +1,22 @@
+name: Check
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["1.85", stable]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --component rustfmt --component clippy
+      - if: matrix.toolchain == 'stable'
+        run: cargo +stable fmt --check
+      - if: matrix.toolchain == 'stable'
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - run: cargo +"${{ matrix.toolchain }}" test --locked
