@@ -1,14 +1,16 @@
 # Goal Ledger
 
-Goal Ledger helps Codex resume the right work after context compaction. It records
-user request identities in local SQLite and puts a short recovery packet in the
-first model request after compaction. The project is independent of OpenAI.
+Goal Ledger is a local task ledger for user prompts and mid-turn steers in
+Codex. At startup, resume, and context compaction, it puts the most recent
+known user request and its status first, followed by earlier unfinished work
+and recent completions. It stores state in SQLite and exposes it through MCP.
 
-When a long-running goal compacts, Codex can retain an old user instruction and
-drop the inline goal continuation. A completed request may then look like a new
-assignment. Goal Ledger distinguishes **observed input** from **open work** and
-**completed work**, using the same ledger across context windows. See
-[the upstream Codex report](https://github.com/openai/codex/issues/27731).
+For example, you might ask Codex to switch from task A to task B. After B is
+completed and Codex resumes, the ledger says B is done and shows what is still
+open on A. Automatic goals make the replay bug easier to see because Codex can
+start the next turn without a new user message. See the
+[upstream Codex report](https://github.com/openai/codex/issues/27731).
+Goal Ledger is an independent project.
 
 ## Install
 
@@ -37,6 +39,10 @@ command -v goal-ledger
    [Codex hooks guide](https://learn.chatgpt.com/docs/hooks#sessionstart)
    describes the required immediate `SessionStart(source=compact)` behavior.
 
+If you’re upgrading from 0.1.0, reinstall with `cargo install --path . --locked`,
+add the `^(startup|resume)$` entry to `SessionStart`, and trust the new hook.
+Goal Ledger migrates the existing database and preserves recorded request status.
+
 The default database is `$XDG_STATE_HOME/goal-ledger/tasks.sqlite3`, or
 `~/.local/state/goal-ledger/tasks.sqlite3`. To use a different database, set
 `GOAL_LEDGER_DB` to the same local path in both the MCP server environment
@@ -46,11 +52,15 @@ listener, or model API key is required by Goal Ledger.
 
 ## Track a request
 
-The user prompt hook gives Codex the ledger session ID. For actionable work,
-find the input with `requests_list`, then use `request_update` to record a
-summary, requirements, status, and the next action. When the work is done,
-record `completed` with evidence such as an artifact, commit, test receipt, or
-job result. `request_get` fetches the current record and revision. Example:
+The prompt hook gives Codex the ledger session ID. Use `request_latest` to
+find the most recent admitted prompt or steer and its recorded status.
+`requests_list` lists earlier requests newest first, with a status
+filter and a cursor for older pages. `request_get` fetches an exact request
+and its revision.
+
+Use `request_update` to record a summary, requirements, status, and the next
+action. Mark work `completed` with evidence such as an artifact, commit, test
+receipt, or job result. For example:
 
 ```json
 {
@@ -63,10 +73,10 @@ job result. `request_get` fetches the current record and revision. Example:
 }
 ```
 
-An observed request stays observed until it is explicitly tracked. An assistant
-reply does not mark a task complete. Two different inputs with the same words
-can still be separate requests. Repeating a completed request intentionally is
-new work under the newly admitted ID.
+An `observed` entry means the ledger has an ID but no recorded task outcome.
+The agent records progress and completion explicitly. Two different inputs
+with the same words can have different IDs, including a later request to
+repeat completed work.
 
 ## What the adapter can verify
 
@@ -77,16 +87,16 @@ new work under the newly admitted ID.
   not save prompt text or attachments. The local database records transcript
   paths and may contain sensitive summaries or evidence references; keep it
   local.
-- Immediately after compaction, the hook sends bounded developer context
-  identifying recent unfinished and completed requests. It does not remove,
-  rewrite, or block any user message. A genuine new steer retains precedence.
+- At startup, resume, or immediately after compaction, the hook sends bounded
+  developer context with the latest user request's recorded status, including
+  an `observed` status. A new steer can change what should happen next.
 
-This is an advisory mitigation. A hook cannot change Codex's internal input
-queue or guarantee the model will follow the ledger. Very large or unavailable
-rollout records, changed internal formats, and transports without a local
-transcript can leave IDs unobserved. The hook never guesses completion from
-missing history. Both the tools and the hook work locally, so delivery can be
-tested without sending private transcripts to a model.
+Recovery context is advisory. On an automatic turn that starts without a
+fresh prompt or a session hook, Codex can refresh the latest status using
+`request_latest`. Very large or unavailable rollout records, changes in
+rollout format, and transports without a local transcript can leave IDs
+unobserved. The ledger relies on explicit completion records. Both hooks
+and MCP work locally, so recovery delivery can be tested with a loopback model.
 
 ## Verify
 
@@ -94,6 +104,7 @@ tested without sending private transcripts to a model.
 cargo test --locked
 cargo build --locked
 python3 tests/desktop_compaction.py --codex "$(command -v codex)" --ledger target/debug/goal-ledger
+python3 tests/steer_compaction.py --codex "$(command -v codex)" --ledger target/debug/goal-ledger
 ```
 
 Use a Codex binary that supports the immediate compact-session hook. The
@@ -101,10 +112,22 @@ synthetic runtime test uses an isolated temporary home and a loopback Responses
 mock. It checks what reaches the first real model request after auto-compaction;
 it does not evaluate how a live model behaves.
 
+The steer fixture sends a real `turn/steer` while the original request is in
+flight. It marks the steer complete before automatic compaction and verifies
+that the first resumed request sees that completion while the original work
+remains in progress and queryable.
+
 The loopback test was verified on Linux with the Codex Desktop bundle
 `0.169.0-alpha.11.1`. The [upstream issue draft](docs/codex-issue-draft.md)
 describes the stale input boundary separately from the local workaround.
 
-To uninstall, remove only the four Goal Ledger hook groups and the
+In a matched live `/goal` comparison on 0.1.0, the completed action ran twice
+with Goal Ledger disabled and once with it enabled. Both goals finished.
+In a separate 0.2.0 spot check, all six active chats continued working. None
+compacted during that window, so the spot check could only assess visible work
+progress. Replay prevention in long-running chats under natural compaction
+remains unverified.
+
+To uninstall, remove the Goal Ledger hook groups and the
 `mcp_servers.goal-ledger` config entry. Keep or delete the local database as
 needed.

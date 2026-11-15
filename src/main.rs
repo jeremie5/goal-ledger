@@ -1,6 +1,7 @@
 mod codex;
 mod ledger;
 mod mcp;
+mod rollout;
 
 use anyhow::{Result, bail};
 use std::path::PathBuf;

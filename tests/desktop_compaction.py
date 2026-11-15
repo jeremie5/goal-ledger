@@ -306,11 +306,34 @@ GOAL_LEDGER_DB = {json.dumps(str(database))}
             raise RuntimeError("first post-compaction model request did not retain the old user input")
         if not any(FRESH_INPUT in text for text in json_texts(continuation, "user")):
             raise RuntimeError("first post-compaction model request did not retain the fresh user input")
+        latest_line = next(
+            (line for line in frame.splitlines() if line.startswith('{"latest_user_request":')),
+            None,
+        )
+        latest = call_mcp_tool(ledger, env, "request_latest", {"session_id": session_id})["request"]
+        if (
+            not latest_line
+            or not latest
+            or latest["request_id"] == request_id
+            or latest["status"] != "observed"
+            or json.loads(latest_line)["latest_user_request"]["id"] != latest["request_id"]
+            or json.loads(latest_line)["latest_user_request"]["status"] != "observed"
+        ):
+            raise RuntimeError("recovery did not identify the fresh input as the latest observed request")
+        page = call_mcp_tool(ledger, env, "requests_list", {"session_id": session_id, "limit": 1})
+        if page["next_before_request_id"] != latest["request_id"]:
+            raise RuntimeError("request history did not return a cursor for the older request")
+        older = call_mcp_tool(ledger, env, "requests_list", {
+            "session_id": session_id, "before_request_id": page["next_before_request_id"],
+        })
+        if [r["request_id"] for r in older["requests"]] != [request_id]:
+            raise RuntimeError("request history failed to retrieve precisely the older input")
 
         print("PASS: compact SessionStart context and completed request reached the immediate local continuation.")
         print("recovery_frame: present with completed request ID and evidence")
         print("old_input: retained in a user message")
         print("fresh_input: retained as a user message")
+        print("latest_input: fresh request shown as observed and older completion queryable")
         advertised = json.dumps(captured[0].get("tools", []))
         print("mcp_tool_advertisement:", "inline" if "requests_list" in advertised else "deferred by Codex")
         print(f"session_id: {session_id}")

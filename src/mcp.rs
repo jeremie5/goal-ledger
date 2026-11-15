@@ -242,6 +242,7 @@ fn call_tool(ledger: &mut Ledger, name: &str, arguments: Value) -> Value {
     };
 
     match name {
+        "request_latest" => request_latest(ledger, args),
         "requests_list" => requests_list(ledger, args),
         "request_get" => request_get(ledger, args),
         "request_update" => request_update(ledger, args),
@@ -249,8 +250,29 @@ fn call_tool(ledger: &mut Ledger, name: &str, arguments: Value) -> Value {
     }
 }
 
+fn request_latest(ledger: &mut Ledger, args: Map<String, Value>) -> Value {
+    if let Err(message) = ensure_only_keys(&args, &["session_id"]) {
+        return tool_error(message);
+    }
+    let session_id = match required_session_id(&args) {
+        Ok(value) => value,
+        Err(message) => return tool_error(message),
+    };
+    let synchronized = match synchronize(ledger, &session_id) {
+        Ok(count) => count,
+        Err(message) => return tool_error(message),
+    };
+    match ledger.latest_admitted(&session_id) {
+        Ok(request) => tool_result(&json!({"request": request, "synchronized": synchronized})),
+        Err(_) => tool_error("Could not read the latest user request."),
+    }
+}
+
 fn requests_list(ledger: &mut Ledger, mut args: Map<String, Value>) -> Value {
-    if let Err(message) = ensure_only_keys(&args, &["session_id", "status", "limit"]) {
+    if let Err(message) = ensure_only_keys(
+        &args,
+        &["session_id", "status", "limit", "before_request_id"],
+    ) {
         return tool_error(message);
     }
     let session_id = match required_session_id(&args) {
@@ -278,14 +300,35 @@ fn requests_list(ledger: &mut Ledger, mut args: Map<String, Value>) -> Value {
         },
         Some(_) => return tool_error("Limit must be an integer from 1 to 25."),
     };
-    let requests = match ledger.list(&session_id, status, limit) {
-        Ok(requests) => requests,
-        Err(_) => return tool_error("Could not list requests."),
+    let before = match args.get("before_request_id") {
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            match required_bounded_string(&args, "before_request_id", MAX_REQUEST_ID_CHARS) {
+                Ok(value) => Some(value),
+                Err(message) => return tool_error(message),
+            }
+        }
     };
+    let mut requests = match ledger.list_admitted(&session_id, status, limit + 1, before.as_deref())
+    {
+        Ok(requests) => requests,
+        Err(_) => {
+            return tool_error(
+                "Could not list requests. Check that before_request_id belongs to this session.",
+            );
+        }
+    };
+    let more = requests.len() > limit as usize;
+    requests.truncate(limit as usize);
+    let next_before = requests
+        .last()
+        .filter(|_| more)
+        .map(|r| r.request_id.clone());
     match serde_json::to_value(requests) {
         Ok(requests) => tool_result(&json!({
             "synchronized": synchronized,
-            "requests": requests
+            "requests": requests,
+            "next_before_request_id": next_before,
         })),
         Err(_) => tool_error("Could not encode requests."),
     }
@@ -496,14 +539,27 @@ fn validate_string_array(
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
+            "name": "request_latest",
+            "description": "Read the latest known original user prompt or steer and its recorded task status. On continuation, check this before treating retained input as current work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "minLength": 1, "maxLength": MAX_SESSION_ID_CHARS, "pattern": "^[A-Za-z0-9_-]+$" }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "requests_list",
-            "description": "List tracked requests for a Codex session.",
+            "description": "List a Codex session's original prompts and steers in reverse admission order. Use next_before_request_id to page to earlier requests.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "minLength": 1, "maxLength": MAX_SESSION_ID_CHARS, "pattern": "^[A-Za-z0-9_-]+$" },
                     "status": { "type": "string", "enum": status_values() },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "default": DEFAULT_LIST_LIMIT }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "default": DEFAULT_LIST_LIMIT },
+                    "before_request_id": { "type": "string", "minLength": 1, "maxLength": MAX_REQUEST_ID_CHARS }
                 },
                 "required": ["session_id"],
                 "additionalProperties": false
@@ -623,11 +679,12 @@ mod tests {
         let tools = responses[1]["result"]["tools"]
             .as_array()
             .expect("tools list is an array");
-        assert_eq!(tools.len(), 3);
-        assert_eq!(tools[0]["name"], "requests_list");
-        assert_eq!(tools[1]["name"], "request_get");
-        assert_eq!(tools[2]["name"], "request_update");
-        assert_eq!(tools[2]["inputSchema"]["additionalProperties"], false);
+        assert_eq!(tools.len(), 4);
+        assert_eq!(tools[0]["name"], "request_latest");
+        assert_eq!(tools[1]["name"], "requests_list");
+        assert_eq!(tools[2]["name"], "request_get");
+        assert_eq!(tools[3]["name"], "request_update");
+        assert_eq!(tools[3]["inputSchema"]["additionalProperties"], false);
     }
 
     #[test]

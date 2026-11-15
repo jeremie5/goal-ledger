@@ -7,20 +7,58 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavio
 use serde::{Deserialize, Serialize};
 
 const APPLICATION_ID: i64 = 0x474c_4447; // "GLDG"
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_LIST_LIMIT: u32 = 500;
+
+const REQUEST_COLUMNS_V1: &[&str] = &[
+    "session_id",
+    "request_id",
+    "turn_id",
+    "revision",
+    "status",
+    "summary",
+    "requirements_json",
+    "next_action",
+    "evidence_json",
+    "created_at_ms",
+    "updated_at_ms",
+];
+const REQUEST_COLUMNS_V2: &[&str] = &[
+    "session_id",
+    "request_id",
+    "turn_id",
+    "revision",
+    "status",
+    "summary",
+    "requirements_json",
+    "next_action",
+    "evidence_json",
+    "created_at_ms",
+    "updated_at_ms",
+    "admission_offset",
+];
+const TRANSCRIPT_COLUMNS: &[&str] = &["session_id", "path", "updated_at_ms"];
 
 const SELECT_REQUEST: &str = "SELECT session_id, request_id, turn_id, revision, status, \
     summary, requirements_json, next_action, evidence_json FROM requests \
     WHERE session_id = ?1 AND request_id = ?2";
 
-const SELECT_REQUESTS_FOR_SESSION: &str = "SELECT session_id, request_id, turn_id, revision, status, \
+const SELECT_LATEST_ADMITTED: &str = "SELECT session_id, request_id, turn_id, revision, status, \
     summary, requirements_json, next_action, evidence_json FROM requests \
-    WHERE session_id = ?1 ORDER BY updated_at_ms DESC, request_id DESC LIMIT ?2";
+    WHERE session_id = ?1 \
+    ORDER BY (admission_offset IS NOT NULL) DESC, COALESCE(admission_offset, 0) DESC, \
+        created_at_ms DESC, request_id DESC LIMIT 1";
 
-const SELECT_REQUESTS_FOR_SESSION_STATUS: &str = "SELECT session_id, request_id, turn_id, revision, status, \
+const SELECT_ADMITTED_REQUESTS: &str = "SELECT session_id, request_id, turn_id, revision, status, \
     summary, requirements_json, next_action, evidence_json FROM requests \
-    WHERE session_id = ?1 AND status = ?2 ORDER BY updated_at_ms DESC, request_id DESC LIMIT ?3";
+    WHERE session_id = ?1 \
+        AND (?2 IS NULL OR status = ?2) \
+        AND (?3 IS NULL OR ( \
+            (admission_offset IS NOT NULL), COALESCE(admission_offset, 0), \
+            created_at_ms, request_id \
+        ) < (?4, ?5, ?6, ?7)) \
+    ORDER BY (admission_offset IS NOT NULL) DESC, COALESCE(admission_offset, 0) DESC, \
+        created_at_ms DESC, request_id DESC LIMIT ?8";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS requests (
@@ -37,6 +75,7 @@ CREATE TABLE IF NOT EXISTS requests (
     evidence_json TEXT NOT NULL DEFAULT '[]',
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
+    admission_offset INTEGER CHECK (admission_offset IS NULL OR admission_offset >= 0),
     PRIMARY KEY (session_id, request_id)
 ) WITHOUT ROWID;
 
@@ -44,12 +83,52 @@ CREATE INDEX IF NOT EXISTS idx_requests_session_updated
     ON requests (session_id, updated_at_ms DESC, request_id DESC);
 CREATE INDEX IF NOT EXISTS idx_requests_session_status_updated
     ON requests (session_id, status, updated_at_ms DESC, request_id DESC);
+CREATE INDEX IF NOT EXISTS idx_requests_session_admission
+    ON requests (
+        session_id,
+        (admission_offset IS NOT NULL) DESC,
+        COALESCE(admission_offset, 0) DESC,
+        created_at_ms DESC,
+        request_id DESC
+    );
+CREATE INDEX IF NOT EXISTS idx_requests_session_status_admission
+    ON requests (
+        session_id,
+        status,
+        (admission_offset IS NOT NULL) DESC,
+        COALESCE(admission_offset, 0) DESC,
+        created_at_ms DESC,
+        request_id DESC
+    );
 
 CREATE TABLE IF NOT EXISTS session_transcripts (
     session_id TEXT PRIMARY KEY CHECK (length(trim(session_id)) > 0),
     path TEXT NOT NULL CHECK (length(path) > 0),
     updated_at_ms INTEGER NOT NULL
 ) WITHOUT ROWID;
+"#;
+
+const MIGRATE_V1_TO_V2_SQL: &str = r#"
+ALTER TABLE requests ADD COLUMN admission_offset INTEGER
+    CHECK (admission_offset IS NULL OR admission_offset >= 0);
+
+CREATE INDEX IF NOT EXISTS idx_requests_session_admission
+    ON requests (
+        session_id,
+        (admission_offset IS NOT NULL) DESC,
+        COALESCE(admission_offset, 0) DESC,
+        created_at_ms DESC,
+        request_id DESC
+    );
+CREATE INDEX IF NOT EXISTS idx_requests_session_status_admission
+    ON requests (
+        session_id,
+        status,
+        (admission_offset IS NOT NULL) DESC,
+        COALESCE(admission_offset, 0) DESC,
+        created_at_ms DESC,
+        request_id DESC
+    );
 "#;
 
 /// Lifecycle state for one durable request record.
@@ -175,11 +254,7 @@ impl Ledger {
     /// Record a request once. Repeated calls preserve existing state. A later
     /// non-empty `turn_id` can fill a missing owner; a conflicting owner errors.
     pub fn record(&mut self, new: &NewRequest) -> Result<Request> {
-        validate_identifier("session_id", &new.session_id)?;
-        validate_identifier("request_id", &new.request_id)?;
-        if let Some(turn_id) = new.turn_id.as_deref() {
-            validate_identifier("turn_id", turn_id)?;
-        }
+        validate_new_request(new)?;
 
         let now = now_ms()?;
         let transaction = self
@@ -234,6 +309,46 @@ impl Ledger {
         Ok(request)
     }
 
+    /// Record the original transcript byte position for an existing request.
+    /// Replayed observations keep the earliest position and do not change the
+    /// request revision or update timestamp.
+    pub fn record_admission(&mut self, request: &NewRequest, byte_offset: u64) -> Result<()> {
+        validate_new_request(request)?;
+        let byte_offset = i64::try_from(byte_offset)
+            .context("request admission byte offset exceeds SQLite integer range")?;
+
+        let (existing_turn, existing_offset): (Option<String>, Option<i64>) = self
+            .connection
+            .query_row(
+                "SELECT turn_id, admission_offset FROM requests \
+                 WHERE session_id = ?1 AND request_id = ?2",
+                params![request.session_id, request.request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("read existing request admission")?;
+        ensure!(
+            request.turn_id.is_none() || request.turn_id == existing_turn,
+            "request has not been recorded with the requested owning turn"
+        );
+        if existing_offset.is_some_and(|existing_offset| existing_offset <= byte_offset) {
+            return Ok(());
+        }
+
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE requests SET admission_offset = ?1 \
+                 WHERE session_id = ?2 AND request_id = ?3 \
+                 AND (admission_offset IS NULL OR admission_offset > ?1)",
+                params![byte_offset, request.session_id, request.request_id],
+            )
+            .context("update request admission offset")?;
+        if changed > 0 {
+            self.secure_files()?;
+        }
+        Ok(())
+    }
+
     /// Fetch one request by its owning session and request identifiers.
     pub fn get(&self, session_id: &str, request_id: &str) -> Result<Option<Request>> {
         validate_identifier("session_id", session_id)?;
@@ -241,12 +356,30 @@ impl Ledger {
         fetch_request(&self.connection, session_id, request_id)
     }
 
-    /// List requests for a session, newest update first, capped at 500 rows.
-    pub fn list(
+    /// Return the most recently admitted request in its original transcript
+    /// order. Requests without a known byte position use creation time.
+    pub fn latest_admitted(&self, session_id: &str) -> Result<Option<Request>> {
+        validate_identifier("session_id", session_id)?;
+        let stored = self
+            .connection
+            .query_row(
+                SELECT_LATEST_ADMITTED,
+                params![session_id],
+                StoredRequest::from_row,
+            )
+            .optional()
+            .context("query latest admitted request")?;
+        stored.map(StoredRequest::into_request).transpose()
+    }
+
+    /// List requests in reverse transcript admission order, capped at 500
+    /// rows. `before` is the request_id of the last row from the previous page.
+    pub fn list_admitted(
         &self,
         session_id: &str,
         status: Option<Status>,
         limit: u32,
+        before: Option<&str>,
     ) -> Result<Vec<Request>> {
         validate_identifier("session_id", session_id)?;
         let limit = i64::from(limit.min(MAX_LIST_LIMIT));
@@ -254,35 +387,64 @@ impl Ledger {
             return Ok(Vec::new());
         }
 
+        let cursor = match before {
+            Some(request_id) => {
+                validate_identifier("before", request_id)?;
+                Some(
+                    self.connection
+                        .query_row(
+                            "SELECT (admission_offset IS NOT NULL), \
+                                COALESCE(admission_offset, 0), created_at_ms, request_id \
+                             FROM requests \
+                             WHERE session_id = ?1 AND request_id = ?2",
+                            params![session_id, request_id],
+                            |row| {
+                                Ok(AdmissionCursor {
+                                    has_offset: row.get(0)?,
+                                    offset: row.get(1)?,
+                                    created_at_ms: row.get(2)?,
+                                    request_id: row.get(3)?,
+                                })
+                            },
+                        )
+                        .optional()
+                        .context("read request admission cursor")?
+                        .ok_or_else(|| {
+                            anyhow!("pagination cursor request was not found in this session")
+                        })?,
+                )
+            }
+            None => None,
+        };
+        let cursor_values = cursor.unwrap_or(AdmissionCursor {
+            has_offset: 0,
+            offset: 0,
+            created_at_ms: 0,
+            request_id: String::new(),
+        });
+
+        let mut statement = self
+            .connection
+            .prepare(SELECT_ADMITTED_REQUESTS)
+            .context("prepare admitted request list")?;
+        let rows = statement
+            .query_map(
+                params![
+                    session_id,
+                    status.map(Status::as_db_str),
+                    before,
+                    cursor_values.has_offset,
+                    cursor_values.offset,
+                    cursor_values.created_at_ms,
+                    cursor_values.request_id,
+                    limit
+                ],
+                StoredRequest::from_row,
+            )
+            .context("query admitted request list")?;
         let mut requests = Vec::new();
-        match status {
-            Some(status) => {
-                let mut statement = self
-                    .connection
-                    .prepare(SELECT_REQUESTS_FOR_SESSION_STATUS)
-                    .context("prepare filtered request list")?;
-                let rows = statement
-                    .query_map(
-                        params![session_id, status.as_db_str(), limit],
-                        StoredRequest::from_row,
-                    )
-                    .context("query filtered request list")?;
-                for row in rows {
-                    requests.push(row.context("read filtered request row")?.into_request()?);
-                }
-            }
-            None => {
-                let mut statement = self
-                    .connection
-                    .prepare(SELECT_REQUESTS_FOR_SESSION)
-                    .context("prepare request list")?;
-                let rows = statement
-                    .query_map(params![session_id, limit], StoredRequest::from_row)
-                    .context("query request list")?;
-                for row in rows {
-                    requests.push(row.context("read request row")?.into_request()?);
-                }
-            }
+        for row in rows {
+            requests.push(row.context("read admitted request row")?.into_request()?);
         }
         Ok(requests)
     }
@@ -437,6 +599,13 @@ struct StoredRequest {
     evidence_json: String,
 }
 
+struct AdmissionCursor {
+    has_offset: i64,
+    offset: i64,
+    created_at_ms: i64,
+    request_id: String,
+}
+
 impl StoredRequest {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -486,6 +655,15 @@ fn fetch_request(
     stored.map(StoredRequest::into_request).transpose()
 }
 
+fn validate_new_request(new: &NewRequest) -> Result<()> {
+    validate_identifier("session_id", &new.session_id)?;
+    validate_identifier("request_id", &new.request_id)?;
+    if let Some(turn_id) = new.turn_id.as_deref() {
+        validate_identifier("turn_id", turn_id)?;
+    }
+    Ok(())
+}
+
 fn validate_existing_database(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect existing ledger path at {}", path.display()))?;
@@ -513,15 +691,42 @@ fn validate_database_identity(connection: &Connection) -> Result<()> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .context("read ledger schema version")?;
     ensure!(
-        application_id == APPLICATION_ID && schema_version == SCHEMA_VERSION,
+        application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&schema_version),
         "existing SQLite database is not a supported goal-ledger database"
     );
-    connection
-        .prepare("SELECT session_id, request_id, turn_id, revision, status, summary, requirements_json, next_action, evidence_json FROM requests LIMIT 0")
-        .context("validate ledger requests table")?;
-    connection
-        .prepare("SELECT session_id, path, updated_at_ms FROM session_transcripts LIMIT 0")
-        .context("validate ledger transcript table")?;
+    let request_columns = if schema_version == 1 {
+        REQUEST_COLUMNS_V1
+    } else {
+        REQUEST_COLUMNS_V2
+    };
+    validate_table_columns(connection, "requests", request_columns)?;
+    validate_table_columns(connection, "session_transcripts", TRANSCRIPT_COLUMNS)?;
+    Ok(())
+}
+
+fn validate_table_columns(connection: &Connection, table: &str, expected: &[&str]) -> Result<()> {
+    let pragma = match table {
+        "requests" => "PRAGMA table_info(requests)",
+        "session_transcripts" => "PRAGMA table_info(session_transcripts)",
+        _ => bail!("unsupported ledger table name"),
+    };
+    let mut statement = connection
+        .prepare(pragma)
+        .with_context(|| format!("inspect {table} table columns"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("read {table} table columns"))?;
+    let mut actual = Vec::new();
+    for row in rows {
+        actual.push(row.with_context(|| format!("read {table} column name"))?);
+    }
+    ensure!(
+        actual
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied()),
+        "existing SQLite database is not a supported goal-ledger database"
+    );
     Ok(())
 }
 
@@ -565,7 +770,17 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             application_id == APPLICATION_ID,
             "ledger database application id is missing"
         );
+        validate_database_identity(connection)?;
         return Ok(());
+    }
+
+    if schema_version == 1 {
+        ensure!(
+            application_id == APPLICATION_ID,
+            "ledger database application id is missing"
+        );
+        validate_database_identity(connection)?;
+        return migrate_v1_to_v2(connection);
     }
 
     if application_id == 0 {
@@ -595,6 +810,35 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .context("write ledger schema version")?;
     transaction.commit().context("commit ledger schema")?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("begin ledger schema migration")?;
+    let application_id: i64 = transaction
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .context("read ledger application id during migration")?;
+    let schema_version: i64 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("read ledger schema version during migration")?;
+    ensure!(
+        application_id == APPLICATION_ID && schema_version == 1,
+        "ledger database ownership changed before migration"
+    );
+    validate_table_columns(&transaction, "requests", REQUEST_COLUMNS_V1)?;
+    validate_table_columns(&transaction, "session_transcripts", TRANSCRIPT_COLUMNS)?;
+
+    transaction
+        .execute_batch(MIGRATE_V1_TO_V2_SQL)
+        .context("add request admission offset")?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("write migrated ledger schema version")?;
+    transaction
+        .commit()
+        .context("commit ledger schema migration")?;
     Ok(())
 }
 
@@ -852,6 +1096,14 @@ mod tests {
         }
     }
 
+    fn named_request(request_id: &str, turn_id: &str) -> NewRequest {
+        NewRequest {
+            session_id: "session-a".to_owned(),
+            request_id: request_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+        }
+    }
+
     #[test]
     fn record_retries_preserve_state_and_reject_owner_conflicts() {
         let db = TempDb::new();
@@ -995,18 +1247,224 @@ mod tests {
 
         assert_eq!(
             ledger
-                .list("session-a", Some(Status::Superseded), 10)
+                .list_admitted("session-a", Some(Status::Superseded), 10, None)
                 .unwrap()
                 .len(),
             1
         );
         assert!(
             ledger
-                .list("session-a", Some(Status::Open), 10)
+                .list_admitted("session-a", Some(Status::Open), 10, None)
                 .unwrap()
                 .is_empty()
         );
-        assert!(ledger.list("session-a", None, 0).unwrap().is_empty());
+        assert!(
+            ledger
+                .list_admitted("session-a", None, 0, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn admission_order_uses_transcript_offsets_and_keyset_pages() {
+        let db = TempDb::new();
+        let mut ledger = Ledger::open(&db.path).unwrap();
+        let earlier = named_request("earlier", "turn-earlier");
+        let middle = named_request("middle", "turn-middle");
+        let latest = named_request("latest", "turn-latest");
+        ledger.record(&earlier).unwrap();
+        ledger.record(&middle).unwrap();
+        ledger.record(&latest).unwrap();
+        ledger.record_admission(&earlier, 10).unwrap();
+        ledger.record_admission(&middle, 20).unwrap();
+        ledger.record_admission(&latest, 30).unwrap();
+
+        let revision_before_replay = ledger
+            .get("session-a", "earlier")
+            .unwrap()
+            .unwrap()
+            .revision;
+        ledger.record_admission(&earlier, 10).unwrap();
+        ledger.record_admission(&earlier, 15).unwrap();
+        let offset_after_replay: i64 = ledger
+            .connection
+            .query_row(
+                "SELECT admission_offset FROM requests WHERE session_id = ?1 AND request_id = ?2",
+                params!["session-a", "earlier"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(offset_after_replay, 10);
+        assert_eq!(
+            ledger
+                .get("session-a", "earlier")
+                .unwrap()
+                .unwrap()
+                .revision,
+            revision_before_replay
+        );
+
+        ledger
+            .update(
+                "session-a",
+                "earlier",
+                &RequestUpdate {
+                    status: Some(Status::Open),
+                    summary: Some("Updated after the later admission".to_owned()),
+                    ..RequestUpdate::default()
+                },
+            )
+            .unwrap();
+
+        let first_page = ledger.list_admitted("session-a", None, 2, None).unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest", "middle"]
+        );
+        let second_page = ledger
+            .list_admitted("session-a", None, 2, Some("middle"))
+            .unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier"]
+        );
+        assert_eq!(
+            ledger
+                .latest_admitted("session-a")
+                .unwrap()
+                .unwrap()
+                .request_id,
+            "latest"
+        );
+        assert_eq!(
+            ledger
+                .list_admitted("session-a", Some(Status::Open), 10, None)
+                .unwrap()
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier"]
+        );
+        assert!(
+            ledger
+                .list_admitted("session-a", None, 2, Some("missing"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v1_migration_preserves_request_state_and_transcript() {
+        let db = TempDb::new();
+        {
+            let connection = Connection::open(&db.path).unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode = DELETE;")
+                .unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE requests (
+                        session_id TEXT NOT NULL CHECK (length(trim(session_id)) > 0),
+                        request_id TEXT NOT NULL CHECK (length(trim(request_id)) > 0),
+                        turn_id TEXT CHECK (turn_id IS NULL OR length(trim(turn_id)) > 0),
+                        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+                        status TEXT NOT NULL DEFAULT 'observed' CHECK (
+                            status IN ('observed', 'open', 'in_progress', 'waiting', 'completed', 'superseded')
+                        ),
+                        summary TEXT,
+                        requirements_json TEXT NOT NULL DEFAULT '[]',
+                        next_action TEXT,
+                        evidence_json TEXT NOT NULL DEFAULT '[]',
+                        created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY (session_id, request_id)
+                    ) WITHOUT ROWID;
+                    CREATE TABLE session_transcripts (
+                        session_id TEXT PRIMARY KEY CHECK (length(trim(session_id)) > 0),
+                        path TEXT NOT NULL CHECK (length(path) > 0),
+                        updated_at_ms INTEGER NOT NULL
+                    ) WITHOUT ROWID;
+                    INSERT INTO requests VALUES (
+                        'session-old', 'request-old', 'turn-old', 7, 'completed',
+                        'Preserve this completed request', '[\"requirement\"]', NULL,
+                        '[\"receipt: old\"]', 1000, 2000
+                    );
+                    INSERT INTO session_transcripts VALUES ('session-old', '/tmp/old.jsonl', 3000);",
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", 1_i64)
+                .unwrap();
+        }
+
+        let ledger = Ledger::open(&db.path).unwrap();
+        let preserved = ledger.get("session-old", "request-old").unwrap().unwrap();
+        assert_eq!(preserved.revision, 7);
+        assert_eq!(preserved.status, Status::Completed);
+        assert_eq!(
+            preserved.summary.as_deref(),
+            Some("Preserve this completed request")
+        );
+        assert_eq!(preserved.requirements, ["requirement"]);
+        assert_eq!(preserved.evidence, ["receipt: old"]);
+        assert_eq!(
+            ledger.transcript("session-old").unwrap(),
+            Some(PathBuf::from("/tmp/old.jsonl"))
+        );
+
+        let schema_version: i64 = ledger
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let migrated_offset: Option<i64> = ledger
+            .connection
+            .query_row(
+                "SELECT admission_offset FROM requests \
+                 WHERE session_id = 'session-old' AND request_id = 'request-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, SCHEMA_VERSION);
+        assert_eq!(migrated_offset, None);
+    }
+
+    #[test]
+    fn malformed_v1_schema_is_rejected_without_mutation() {
+        let db = TempDb::new();
+        {
+            let connection = Connection::open(&db.path).unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode = DELETE;")
+                .unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE requests (session_id TEXT NOT NULL, request_id TEXT NOT NULL);
+                    CREATE TABLE session_transcripts (
+                        session_id TEXT PRIMARY KEY, path TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", 1_i64)
+                .unwrap();
+        }
+
+        let before = fs::read(&db.path).unwrap();
+        assert!(Ledger::open(&db.path).is_err());
+        assert_eq!(fs::read(&db.path).unwrap(), before);
     }
 
     #[test]
