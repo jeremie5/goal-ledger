@@ -61,7 +61,7 @@ pub fn run_hook(db_path: &Path) -> Result<()> {
             event.source.as_deref() == Some("compact"),
         )?),
         "UserPromptSubmit" => Some(format!(
-            "Goal Ledger session {}. Confirm input ID/status via request_latest. \
+            "Goal Ledger session {}. Track confirmed current IDs only (request_latest). \
              Save progress and proof via request_update before ending the turn. {HANDOFF_GUIDANCE}",
             event.session_id
         )),

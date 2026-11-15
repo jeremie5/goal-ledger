@@ -567,7 +567,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "request_get",
-            "description": "Read a request by ID.",
+            "description": "Read a request by session and ID.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
